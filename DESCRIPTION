@@ -1,0 +1,92 @@
+Package: EpiSim
+Title: Build multi-compartment models via an Excel workbook
+Version: 0.12.7
+Authors@R: 
+    c(person(given = "Antoinette",
+             family = "Ludwig",
+             role = "aut",
+             email = "antoinette.ludwig@canada.ca",
+             comment = "Public Health Agency of Canada"),
+      person(given = "Philippe",
+             family = "Berthiaume",
+             role = "aut",
+             email = "philippe.berthiaume@canada.ca",
+             comment = "Public Health Agency of Canada"),
+      person(given = "Claude",
+             family = "Nadeau",
+             role = c("aut", "cre"),
+             email = "claude.nadeau@statcan.gc.ca",
+             comment = "Statistics Canada"),
+      person(given = "Maikol",
+             family = "Diasparra",
+             role = "aut",
+             email = "maikol.diasparra@statcan.gc.ca",
+             comment = "Statistics Canada"),
+      person(given = "Joel",
+             family = "Barnes",
+             role = "aut",
+             email = "joel.barnes@statcan.gc.ca",
+             comment = "Statistics Canada"),
+      person(given = "Deirdre",
+             family = "Hennessy",
+             role = "aut",
+             email = "deirdre.hennessy@statcan.gc.ca",
+             comment = "Statistics Canada"),
+      person(given = "Rochelle",
+             family = "Garner",
+             role = "aut",
+             email = "rochelle.garner@statcan.gc.ca",
+             comment = "Statistics Canada"),
+      person(given = "Erin",
+             family = "Rees",
+             role = "ctb",
+             email = "erin.rees@canada.ca",
+             comment = "Public Health Agency of Canada"),
+      person(given = "Howard",
+             family = "Swerdfeger",
+             role = "ctb",
+             email = "howard.swerdfeger@canada.ca",
+             comment = "Public Health Agency of Canada"),
+      person(given = "Julien",
+             family = "Arino",
+             role = "ctb",
+             email = "julien.arino@umanitoba.ca",
+             comment = "University of Manitoba"),
+      person(given = "Saeid",
+             family = "Molladavoudi",
+             role = "ctb",
+             email = "saeid.molladavoudi@canada.ca",
+             comment = "Statistics Canada"))
+Description: The R package EpiSim enables users to build
+    multi-compartment models (ODE or CTMC) via an Excel workbook which
+    specifies the model structure and age stratification. EpiSim has tools
+    for sensitivity analyses and visualization of model results.
+License: GPL-3
+Depends: 
+    R (>= 2.10)
+VignetteBuilder: 
+    knitr
+Encoding: UTF-8
+Language: en
+LazyData: true
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.1.1
+Imports: 
+    adaptivetau,
+    deSolve,
+    dplyr,
+    DT,
+    forcats,
+    ggplot2,
+    htmlwidgets,
+    lhs,
+    magrittr,
+    openxlsx,
+    plotly,
+    readxl,
+    scales,
+    tidyr,
+    triangle
+Suggests: 
+    knitr,
+    rmarkdown

@@ -3,7 +3,7 @@
 #' @export
 #'
 #' @importFrom adaptivetau ssa.adaptivetau
-#' @importFrom deSolve lsoda
+#' @importFrom deSolve lsoda ode
 #' @importFrom dplyr arrange filter is.tbl mutate select slice
 #' @importFrom magrittr %>%
 #' @importFrom readxl read_excel
@@ -11,7 +11,7 @@
 #'
 #' @param file.name a character element.
 #' @param sheets.names a list.
-#' @param just.get.functions a logical element (by default, FALSE).
+#' @param episim.controls a list containing one or more of the following: $run.until, $insert.tmins, $insert.tmin.char, $times.of.interest, $import.system.snapshots, $export.system.snapshot.time, $deSolve.controls (by default, NULL).
 #' @param functions.kit a list containing one or more of the following: $differential.eqns.func, $post.processing.func, $post.processing.companion.kit, $CTMC.eqns.func, $CTMC.eqns.func.companion (by default, NULL).
 #' @param also.get.flows a character element (by default, NULL).
 #' @param agegrp.glue a character element (by default, an empty character element).
@@ -40,7 +40,7 @@
 #'
 #' @return a list containing the results of the box/compartment model.
 
-seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE, functions.kit=NULL,
+seir.n.age.classes = function(file.name, sheets.names, episim.controls=NULL,  functions.kit=NULL,
                               also.get.flows=NULL, agegrp.glue="", CTMC.random.seeds=NULL) # agegrp.glue=".ag"
 {
   # functions.kit may be NULL or a list containing SOME of the following
@@ -50,18 +50,27 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
   #   $CTMC.eqns.func
   #   $CTMC.eqns.func.companion
 
+
+  time.stamps = data.frame(begin=Sys.time())
+
+  times.of.interest = episim.controls$times.of.interest
+
+
   if(is.null(functions.kit$CTMC.eqns.func.companion) != is.null(functions.kit$CTMC.eqns.func))
     stop("\n CTMC.eqns.func and CTMC.eqns.func.companion must be both provided or both omitted")
 
-  expected.sheets.names = c("parms.notime.0d","parms.0d","parms.1d","parms.2d","initial.conditions","model.flow","auxiliary.vars")
+  expected.sheets.names = c("parms.notime.0d","parms.0d","parms.1d","parms.2d","initial.conditions","model.flow","auxiliary.vars","post.processing")
 
   if( !all( expected.sheets.names %in% names(sheets.names) ) )
     stop( paste("\n sheets.names must provide the following:",paste(expected.sheets.names,collapse=", ")) )
 
+  auxiliary.calculations.kit = sheets.names [ setdiff(names(sheets.names),expected.sheets.names)] # sheets.names with expected.sheets.names removed (may be empty list)
+
+
 
   stop.if.tbl = function(x)
   {
-    if(is.tbl(x))
+    if(dplyr::is.tbl(x))
       stop (paste("\n tbl object detected:" , deparse(substitute(x)) ))
   }
 
@@ -74,35 +83,153 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
   #   Initial conditions and parameters
   #==========================================================================
 
-  tmp_parm_notime_0d = sheets.names$parms.notime.0d     # 0 dimensional parameters (no age, no time)
-  tmp_parm_0d        = sheets.names$parms.0d            # 0 dimensional parameters (no age       )
-  tmp_parm_1d        = sheets.names$parms.1d            # 1 dimensional parameters (   age       )
-  tmp_parm_2d        = sheets.names$parms.2d            # 2 dimensional parameters (   age x age )
-  input_stuff        = sheets.names$initial.conditions  # initial values/conditions
+  read.parms = function(file.name,char.or.list)
+  {
+    if(is.list(char.or.list))
+      return (char.or.list)  # char.or.list is a list or a data.frame (initial.conditions) --> return as is
 
-  if(!is.data.frame(tmp_parm_notime_0d))
-    tmp_parm_notime_0d <- as.data.frame ( readxl::read_excel(file.name, sheet = tmp_parm_notime_0d) )  # 0 dimensional parameters
+    char.or.list = char.or.list[!is.na(char.or.list)]  # remove NA
+    list.parms = list()
+    for(k in char.or.list)
+      list.parms[[                k ]] = as.data.frame ( readxl::read_excel(file.name, sheet = k) )
+    # list.parms[[paste("Source:",k)]] = as.data.frame ( readxl::read_excel(file.name, sheet = k) ) # not helpful if going to use save.model.in.workbook
 
-  if(!is.data.frame(tmp_parm_0d))
-    tmp_parm_0d <- as.data.frame ( readxl::read_excel(file.name, sheet = tmp_parm_0d) )  # 0 dimensional parameters
+    list.parms
+  }
 
-  if(!is.data.frame(tmp_parm_1d))
-    tmp_parm_1d <- as.data.frame ( readxl::read_excel(file.name, sheet = tmp_parm_1d) )  # 1 dimensional parameters
+  substitute.character = function(dframe.to.alter, df.vars.to.replace, replace.from.to, move.to.end)
+  { # replaces char.to.replace = "?" (say) by replace.with = "Elvis1", "Elvis2" "Elvis3"  in
+    # So this dframe
+    #       var1   var2   var3 var4
+    #       Salut   44     ABC   55
+    # Hello?There    0     A?B    2
+    #     Goodbye    9     DEF    0
+    #    Hi?There    1     GHI   44
+    # becomes this (move.to.end = FALSE)
+    #             var1   var2       var3 var4
+    #            Salut     44        ABC   55
+    # HelloElvis1There      0   AElvis1B    2
+    # HelloElvis2There      0   AElvis2B    2
+    # HelloElvis3There      0   AElvis3B    2
+    #          Goodbye      9        DEF    0
+    #    HiElvis1There      1        GHI   44
+    #    HiElvis2There      1        GHI   44
+    #    HiElvis3There      1        GHI   44
+    # ... or becomes this (move.to.end = TRUE).  Besides moving to end, replace.with kind of acts as outer loop when move.to.end = TRUE is used
+    #             var1   var2       var3 var4
+    #            Salut     44        ABC   55
+    #          Goodbye      9        DEF    0
+    # HelloElvis1There      0   AElvis1B    2
+    #    HiElvis1There      1        GHI   44
+    # HelloElvis2There      0   AElvis2B    2
+    #    HiElvis2There      1        GHI   44
+    # HelloElvis3There      0   AElvis3B    2
+    #    HiElvis3There      1        GHI   44
 
-  if(!is.data.frame(tmp_parm_2d))
-    tmp_parm_2d <- as.data.frame ( readxl::read_excel(file.name, sheet = tmp_parm_2d) ) # 2 dimensional parameters
+    char.to.replace = replace.from.to[ 1,1]
+    replace.with    = replace.from.to[-1,1]
+    replace.with    = replace.with[!is.na(replace.with)]
 
+    if(grepl("#",char.to.replace) )
+      stop("\n Should not use # as character to be substituted.\n")
+
+
+    dframe = dframe.nocomments = dframe.to.alter
+    dframe.nocomments[,df.vars.to.replace]=sapply(dframe.nocomments[,df.vars.to.replace,drop=FALSE],stringr::word,sep="#") # remove part after # ... only used for found.char
+
+    dframe$row.number.128451165655423655656 = paste(seq(nrow(dframe)))
+   #dframe$found.char.128451165655423655656 = apply( grepl(char.to.replace , as.matrix(dframe[,df.vars.to.replace,drop=FALSE]) ,fixed=TRUE), 1, any) # does not work
+   #found.char = sapply (dframe           [,df.vars.to.replace,drop=FALSE]  ,function(x) {grepl(char.to.replace , x,fixed=TRUE)} )
+    found.char = sapply (dframe.nocomments[,df.vars.to.replace,drop=FALSE]  ,function(x) {grepl(char.to.replace , x,fixed=TRUE)} )
+    dframe$found.char.128451165655423655656 = apply( found.char, 1, any)
+
+    dframe.donotchange  = subset(dframe,!found.char.128451165655423655656)
+    dframe.needtochange = subset(dframe, found.char.128451165655423655656)
+
+    if(nrow(dframe.needtochange) == 0)
+      return(dframe.to.alter)  # return unchanged
+
+    #BEGIN carry out the substitution on dframe.needtochange
+    # Couple of ideas with loops.  Decided to not use for loops.  Code may have been simpler to read ... or not
+    #    for(replace.char in replace.with)
+    #      dframe.changed = rbind(dframe.changed, gsub(char.to.replace,char.to.replace,dframe.needtochange,fixed=TRUE)  )
+
+    #    for(k in seq(nrow(dframe.needtochange)))
+    #      for(replace.char in replace.with)
+
+    replace.with = unique(replace.with[!is.na(replace.with)])
+    replace.with.order = sort( paste0( seq(length(replace.with)) ) ) # "1"  "10" "11" "12" "2"  "3"  "4"  "5"  "6"  "7"  "8"  "9" ... so code below works OK if length > 9
+    names(replace.with.order) = replace.with  # if replace.with = c("D" "A", "B"), this allows use to remember that "A" was second because replace.with.order["A"] = "2"
+
+    dframe.needtochange$char.to.replace.128451165655423655656 = char.to.replace # "?"
+    mat.needtochange = as.matrix(dframe.needtochange[,c("row.number.128451165655423655656","char.to.replace.128451165655423655656",df.vars.to.replace)])
+    mat.changed =  c(t( sapply(replace.with, function(x) {gsub(char.to.replace,x,mat.needtochange,fixed=TRUE) } ) ))
+    mat.changed = array(mat.changed,dim(mat.needtochange)*c(length(replace.with),1))
+    colnames(mat.changed) = colnames(mat.needtochange)
+    mat.changed[,"char.to.replace.128451165655423655656"] = replace.with.order[mat.changed[,"char.to.replace.128451165655423655656"]]  # "A" becomes "2", "B" becomes "3",
+
+
+    dframe.needtochange[c(df.vars.to.replace,"char.to.replace.128451165655423655656","found.char.128451165655423655656")] = c() # some cleaning before inner_join
+    dframe.needtochange = dplyr::inner_join(dframe.needtochange,as.data.frame(mat.changed),by="row.number.128451165655423655656")
+    dframe.needtochange$replace.order.128451165655423655656 = replace.with.order[dframe.needtochange$char.to.replace.128451165655423655656]
+    dframe.needtochange$row.number.128451165655423655656 = as.numeric(dframe.needtochange$row.number.128451165655423655656)
+
+    #END carry out the substitution on dframe.needtochange
+
+    #BEGIN re-assemble
+    if(move.to.end)
+    {
+      dframe.needtochange = dplyr::arrange(dframe.needtochange ,   replace.order.128451165655423655656 , row.number.128451165655423655656      )
+      dframe.out = rbind( dframe.donotchange[names(dframe.to.alter)], dframe.needtochange[names(dframe.to.alter)] )
+    }
+    else
+    {
+      dframe.donotchange$row.number.128451165655423655656 = as.numeric(dframe.donotchange$row.number.128451165655423655656)
+      dframe.donotchange$replace.order.128451165655423655656 = "Hello" # does not matter because row.number.128451165655423655656 unique and distinct from dframe.needtochange
+      keep.vars = c(names(dframe.to.alter), "replace.order.128451165655423655656" , "row.number.128451165655423655656" )
+      dframe.out = rbind( dframe.donotchange[keep.vars], dframe.needtochange[keep.vars] )
+      dframe.out = dplyr::arrange(dframe.out,  row.number.128451165655423655656,   replace.order.128451165655423655656 )[names(dframe.to.alter)]
+    }
+
+    #END re-assemble
+
+ #   if(sum(df.vars.to.replace=="code") >0)
+  #    browser()
+
+    dframe.out
+
+  }# end function substitute.character
+
+
+  substitute.kit=sheets.names$substitute.kit  # list(replace.this.character,replace.with) # replace.with = df with $initial.conditions, $model.flow
+
+  tmp_parm_notime_0d = read.parms(file.name, sheets.names$parms.notime.0d    )     # 0 dimensional parameters (no age, no time) ... a list
+  tmp_parm_0d        = read.parms(file.name, sheets.names$parms.0d           )     # 0 dimensional parameters (no age         ) ... a list
+  tmp_parm_1d        = read.parms(file.name, sheets.names$parms.1d           )     # 1 dimensional parameters (   age         ) ... a list
+  tmp_parm_2d        = read.parms(file.name, sheets.names$parms.2d           )     # 2 dimensional parameters (   age x age   ) ... a list
+
+  input_stuff        = read.parms(file.name, sheets.names$initial.conditions )     # initial values/conditions                  ... a list or a data.frame
   if(!is.data.frame(input_stuff))
-    input_stuff  <- as.data.frame ( readxl::read_excel(file.name, sheet = input_stuff) ) # initial values/conditions
+    input_stuff = input_stuff[[1]]
 
-  stop.if.tbl(tmp_parm_notime_0d)
-  stop.if.tbl(tmp_parm_0d)
-  stop.if.tbl(tmp_parm_1d)
-  stop.if.tbl(tmp_parm_2d)
-  stop.if.tbl(input_stuff      )
+  for(k in names(substitute.kit))
+      input_stuff = substitute.character(input_stuff, "NAME", substitute.kit[k], TRUE)
+
+  input_stuff = subset(input_stuff,!duplicated(NAME)) # keeps the first one if there are duplicates
 
   raw.init.conditions = input_stuff # keep snapshot for output.  input_stuff may be altered later
 
+  if( diff(range(input_stuff$time)) !=0)
+    stop("\n 'time' must be provided and should not vary in initial conditions.")
+
+  run.from = input_stuff$time[1]
+
+  run.until = episim.controls$run.until
+  run.until = ifelse(is.null(run.until), Inf, run.until) # convert NULL into Inf
+
+  input_stuff = subset(input_stuff,select = -time)
+
+  nagegrp = ncol(input_stuff) - 1            # number of age groups
   init.cond.numeric.vars = setdiff(colnames(input_stuff),"NAME")
 
   init_list <- list() # Same content as input_stuff but in a list format
@@ -110,8 +237,6 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
     init_list[[k]] <- as.matrix( subset(input_stuff, NAME == k)[,init.cond.numeric.vars] )
 
 
-  nagegrp <- length(unique(tmp_parm_1d$agegrp)) # number of age groups
-  nagegrp = ncol(raw.init.conditions) - 1       # number of age groups
 
   #BEGIN get raw.compartments.age and pretty.compartments.age
   agegrp.suffix.pretty = agegrp.suffix = ""
@@ -121,7 +246,7 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
     agegrp.suffix.pretty = paste0(agegrp.glue,1:nagegrp) # if agegrp.glue = ".ag" this generates ".ag1" ".ag2" ".ag3"
   }
 
-  raw.compartments =   raw.init.conditions$NAME # e.g.  S D L
+  raw.compartments =   input_stuff$NAME # e.g.  S D L
   raw.compartments.age = c ( t( outer( raw.compartments,agegrp.suffix       ,paste0) ) ) # e.g. S1    S2    S3    S4    S5    D1    D2    ...
   pretty.compartments.age = c ( t( outer( raw.compartments,agegrp.suffix.pretty,paste0) ) ) # e.g. S.ag1 S.ag2 S.ag3 S.ag4 S.ag5 D.ag1 D.ag2 ...
 
@@ -131,50 +256,147 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
   # Then S11 could be 11th age group of S or first age group of S1
   #END get raw.compartments.age and pretty.compartments.age
 
-  nrow_   <- dim(tmp_parm_1d)[1]/nagegrp
-
+  #BEGIN 1) Sort parameters. 2) Get tmins, max.tmax. 3) Various user error handling
   parm_value_notime_0d = tmp_parm_notime_0d
+  parm_value_0d        = tmp_parm_0d
+  parm_value_1d        = tmp_parm_1d
+  parm_value_2d        = tmp_parm_2d
 
-  parm_value_0d <- dplyr::arrange(tmp_parm_0d, tmin        ) # sort by tmin
-  parm_value_0d$isim = 1:nrow_  # (1:nrow(parm_value_0d))
+  all.parm.names = max.tmax = tmins = c()
 
-  parm_value_1d <- dplyr::arrange(tmp_parm_1d, tmin, agegrp) # sort by tmin agegrp
-  parm_value_1d <- parm_value_1d %>%
-    mutate(isim = rep(1:nrow_, each=nagegrp))
+  for(k in names(parm_value_0d))
+  {
+    parm_value_0d[[k]] <- dplyr::arrange(parm_value_0d[[k]], tmin        ) # sort by tmin
+    tmins    = c(    parm_value_0d[[k]]$tmin  , tmins    )
+    max.tmax = c(max(parm_value_0d[[k]]$tmax) , max.tmax )
+    all.parm.names = c( names(parm_value_0d[[k]]) , all.parm.names)
+    if(max(parm_value_0d[[k]]$tmin) >= max.tmax [1])
+      stop(paste("\nMaximum tmin > Maximum tmin in sheet",k,"\n"))
+  }
 
-  parm_value_2d <- dplyr::arrange(tmp_parm_2d, tmin, cagegrp, ragegrp) # sort by tmin cagegrp  ragegrp
-  parm_value_2d <- parm_value_2d %>%
-    mutate(isim = rep(1:nrow_, each = nagegrp*nagegrp))
+  for(k in names(parm_value_1d))
+  {
+    parm_value_1d[[k]] <- dplyr::arrange(parm_value_1d[[k]], tmin, agegrp ) # sort by tmin agegrp
+    tmins    = c(    parm_value_1d[[k]]$tmin  , tmins    )
+    max.tmax = c(max(parm_value_1d[[k]]$tmax) , max.tmax )
+    all.parm.names = c( names(parm_value_1d[[k]]) , all.parm.names)
+    if(max(parm_value_1d[[k]]$tmin) >= max.tmax [1])
+      stop(paste("\nMaximum tmin > Maximum tmin in sheet",k,"\n"))
+
+  }
+
+  for(k in names(parm_value_2d))
+  {
+    parm_value_2d[[k]] <- dplyr::arrange(parm_value_2d[[k]], tmin, cagegrp, ragegrp ) # sort by tmin cagegrp ragegrp
+    tmins    = c(    parm_value_2d[[k]]$tmin  , tmins    )
+    max.tmax = c(max(parm_value_2d[[k]]$tmax) , max.tmax )
+    all.parm.names = c( names(parm_value_2d[[k]]) , all.parm.names)
+    if(max(parm_value_2d[[k]]$tmin) >= max.tmax [1])
+      stop(paste("\nMaximum tmin > Maximum tmin in sheet",k,"\n"))
+
+  }
+
+  if(diff(range(max.tmax)) > 0)
+    stop("\nMaximum tmax should be the same in all sheets providing parameter values.\n")
+
+  excluded_names <- c("tmin", "tmax","agegrp","cagegrp","ragegrp")
+  freq.parm.names = table(setdiff(all.parm.names,excluded_names))
+  freq.parm.names = freq.parm.names[freq.parm.names>1]
+  if(length( freq.parm.names )>0)
+    stop(paste("\n Parameters specified multiple times:" ,names(freq.parm.names),"\n") )
+
+  if(run.until < max.tmax[1])
+    tmins = c(tmins,run.until)
+
+  #END 1) Sort parameters. 2) Get tmins, max.tmax. 3) Various user error handling
 
 
-  nTimeSegments <- max(parm_value_1d$isim)
-  CTMC.parms.info = list(tmin.vect=sort(unique(parm_value_1d$tmin)),parms.0d=list(),parms.1d=list(),parms.2d=list())
+  get.parameter.chunk = function(liste,insert.this.tmin.tmax)
+  {
+    tmin.tmax.present = any(names(liste[[1]]) == "tmin")
+
+    parm.chunk = c()
+    for(k in names(liste)) # e.g. "Parm by age (part 1)" "Parm by age (part 2)" "Parm by age (part 3)"
+    {
+      if(tmin.tmax.present)
+      {
+        relevant.tmin = unique(liste[[k]]$tmin)
+        relevant.tmin = max( relevant.tmin [relevant.tmin <= insert.this.tmin.tmax[1]] )
+        add.chunk = subset(liste[[k]] , tmin==relevant.tmin)
+      }
+      else
+        add.chunk = liste[[k]]
+
+      if(is.null(parm.chunk))
+        parm.chunk = add.chunk
+      else
+        parm.chunk = cbind(parm.chunk, add.chunk[,setdiff(names(add.chunk),names(parm.chunk) )]  )
+
+    }
+    if(tmin.tmax.present)
+    {
+      parm.chunk$tmin = insert.this.tmin.tmax[1]
+      parm.chunk$tmax = insert.this.tmin.tmax[2]
+    }
+
+    parm.chunk
+  }
+ # browser()
+
+
+
+  parm_value_notime_0d.df = get.parameter.chunk(parm_value_notime_0d , "insert.this.tmin.tmax not needed" )
+
+  #BEGIN alter some controls based on what was provided in parm_value_notime_0d (alteration of deSolve.controls is done later)
+  #if(run.until > 0)
+  #  browser()
+
+  insert.extra.tmin = parm_value_notime_0d.df[episim.controls$insert.tmin.char]
+  if(ncol(insert.extra.tmin)==1) # found variable with proper name  ( episim.controls$insert.tmin.char )
+    episim.controls$insert.tmins = c(episim.controls$insert.tmins , insert.extra.tmin[,1])
+
+  #END alter some controls based on what was provided in parm_value_notime_0d (alteration of deSolve.controls is done later)
+
+# CTMC.parms.info = list(tmin.vect=sort( unique (c(tmins,run.from,episim.controls$insert.tmins) )) ,parms.0d=list(),parms.1d=list(),parms.2d=list() )
+  CTMC.parms.info = list(tmin.vect=sort( unique (c(tmins,    0   ,episim.controls$insert.tmins) )) ,parms.0d=list(),parms.1d=list(),parms.2d=list() )
+  CTMC.parms.info$tmin.vect = CTMC.parms.info$tmin.vect[CTMC.parms.info$tmin.vect< max.tmax[1]] # $tmin.vect should not be contaminated with large $insert.tmins
+  nTimeSegments <- length(CTMC.parms.info$tmin.vect)
+
+
+ # overlap.length = function(L1,U1,L2,U2) { pmax(pmin(U1,U2) - pmax(L1,L2),0) } # computes length of intersection of (L1,U1) and (L2,U2) # part of EpiSim since version 0.12.15
+
 
   segments.labels = c()
   for(segment in seq(1, nTimeSegments, 1))
   {
+    insert.this.tmin.tmax = c(CTMC.parms.info$tmin.vect,max.tmax[1])[segment+(0:1)]
+   #if(overlap.length(run.from,run.until,insert.this.tmin.tmax[1],insert.this.tmin.tmax[2]))
+    if(overlap.length(0       ,run.until,insert.this.tmin.tmax[1],insert.this.tmin.tmax[2])) # do as if running from time 0 for now
+    {
+      CTMC.parms.info$parms.0d[[segment]] = get.parameter.chunk(parm_value_0d , insert.this.tmin.tmax ) # this is a data.frame
+      CTMC.parms.info$parms.1d[[segment]] = get.parameter.chunk(parm_value_1d , insert.this.tmin.tmax ) # this is a data.frame
+      CTMC.parms.info$parms.2d[[segment]] = get.parameter.chunk(parm_value_2d , insert.this.tmin.tmax ) # this is a data.frame
 
-    #   CTMC.parms.info$parms.0d[[segment]] = subset(parm_value_0d, isim == segment) # also want to drop isim
-    #   CTMC.parms.info$parms.1d[[segment]] = subset(parm_value_1d, isim == segment)
-    #   CTMC.parms.info$parms.2d[[segment]] = subset(parm_value_2d, isim == segment)
-    CTMC.parms.info$parms.0d[[segment]] = parm_value_0d %>% filter(isim == segment) %>% select(-isim)
-    CTMC.parms.info$parms.1d[[segment]] = parm_value_1d %>% filter(isim == segment) %>% select(-isim)
-    CTMC.parms.info$parms.2d[[segment]] = parm_value_2d %>% filter(isim == segment) %>% select(-isim)
+      segments.labels = c(segments.labels,paste(  insert.this.tmin.tmax ,collapse = "-->") )
 
-    segments.labels = c(segments.labels,paste(CTMC.parms.info$parms.0d[[segment]][,c("tmin","tmax")],collapse = "-->") )
+      CTMC.parms.info$parms.0d[[segment]] = cbind(CTMC.parms.info$parms.0d[[segment]] , parm_value_notime_0d.df)
 
-    CTMC.parms.info$parms.0d[[segment]] = cbind(CTMC.parms.info$parms.0d[[segment]] , parm_value_notime_0d)
+      # Right now CTMC.parms.info$parms.2d[[segment]] is data.frame (akin to CTMC.parms.info$parms.0d[[segment]] and CTMC.parms.info$parms.1d[[segment]] )
+      # Consider Changing CTMC.parms.info$parms.2d[[segment]] from data.frame to list of matrices
+      # look for temp[cbind(age.age.parms$ragegrp, age.age.parms$cagegrp)]
+    }
 
-    # Right now CTMC.parms.info$parms.2d[[segment]] is data.frame (akin to CTMC.parms.info$parms.0d[[segment]] and CTMC.parms.info$parms.1d[[segment]] )
-    # Consider Changing CTMC.parms.info$parms.2d[[segment]] from data.frame to list of matrices
-    # look for temp[cbind(age.age.parms$ragegrp, age.age.parms$cagegrp)]
   }
-  names(CTMC.parms.info$parms.0d) = segments.labels
-  names(CTMC.parms.info$parms.1d) = segments.labels
-  names(CTMC.parms.info$parms.2d) = segments.labels
 
-  rm(parm_value_notime_0d, parm_value_0d, parm_value_1d, parm_value_2d, segments.labels)
+  if(length(segments.labels) > 0)
+  {
+    names(CTMC.parms.info$parms.0d) = segments.labels
+    names(CTMC.parms.info$parms.1d) = segments.labels
+    names(CTMC.parms.info$parms.2d) = segments.labels
+  }
 
+
+  rm(parm_value_notime_0d, parm_value_0d, parm_value_1d, parm_value_2d, segments.labels, parm_value_notime_0d.df, nTimeSegments)
 
   #===================================================================
   # Build function eval.post.processing.func (if not provided)
@@ -182,7 +404,7 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
 
   code.body.df = sheets.names$post.processing # data.frame or string
   if(!is.data.frame(code.body.df))
-    code.body.df = as.data.frame ( readxl::read_excel(file.name, sheet = code.body.df ) )
+    code.body.df = as.data.frame ( readxl::read_excel(file.name, sheet = code.body.df[1] ) )
 
   stop.if.tbl(code.body.df)
 
@@ -204,9 +426,10 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
                        "parms.0d            = list.solution.etcetera$input.info$parms.0d",
                        "parms.1d            = list.solution.etcetera$input.info$parms.1d",
                        "parms.2d            = list.solution.etcetera$input.info$parms.2d",
-                       "initial.conditions  = list.solution.etcetera$input.info$initial.conditions",
                        "companion.kit       = list.solution.etcetera$functions$post.processing.companion.kit",
                        "input.info.verbatim = list.solution.etcetera$input.info.verbatim",
+                       "initial.conditions  = list.solution.etcetera$input.info$initial.conditions",
+                       "initial.conditions$time  = c() # There was no time before EpiSim 0.12.15",
                        "sommaire            = data.frame(osqvhfipumzcdjblkwrgnexaty=4)" ,
                        "## BEGIN code from excel"  )
     code.tail.char = c("## END code from excel",
@@ -228,18 +451,22 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
   auxiliary.vars  = sheets.names$auxiliary.vars
 
   if(!is.data.frame(auxiliary.vars))
-    auxiliary.vars   <- as.data.frame ( readxl::read_excel(file.name, sheet = auxiliary.vars ) )  # auxiliary variables in equations
+    auxiliary.vars   <- as.data.frame ( readxl::read_excel(file.name, sheet = auxiliary.vars[1] ) )  # auxiliary variables in equations
 
   stop.if.tbl(auxiliary.vars)
   auxiliary.vars = subset(auxiliary.vars, !is.na(code)   )  # auxiliary.vars$code will be top portion of with(...,{ ... })  part
+  for(k in names(substitute.kit))
+      auxiliary.vars = substitute.character(auxiliary.vars, "code", substitute.kit[k], FALSE)
 
 
   if(!is.data.frame(model_flows_tmp))
-    model_flows_tmp  <- as.data.frame ( readxl::read_excel(file.name, sheet = model_flows_tmp) )  # arrows in flowchart
+    model_flows_tmp  <- as.data.frame ( readxl::read_excel(file.name, sheet = model_flows_tmp[1]) )  # arrows in flowchart
 
   stop.if.tbl(model_flows_tmp)
   model_flows_tmp = subset( model_flows_tmp,!is.na(expression) & activation ==1)
-
+  for(k in names(substitute.kit))
+      model_flows_tmp = substitute.character(model_flows_tmp, c("From","To","expression"), substitute.kit[k], TRUE)
+ # browser()
   #===================================================================
   # Build function eval.differential.eqns.func (if not provided)
   #===================================================================
@@ -292,9 +519,9 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
       model_flows$multiplier = NA
 
     model_flows = model_flows %>%
-      mutate(fromstar = ifelse(is.na(multiplier),"",paste0(From,"*(")) ,
-             closing.parenthesis = ifelse(is.na(multiplier),"",")") ,
-             expression = paste0(fromstar,expression,closing.parenthesis) )
+      dplyr::mutate(fromstar = ifelse(is.na(multiplier),"",paste0(From,"*(")) ,
+                  closing.parenthesis = ifelse(is.na(multiplier),"",")") ,
+                  expression = paste0(fromstar,expression,closing.parenthesis) )
 
     boxes = unique(c(model_flows$From,model_flows$To))
     outflows=rep("#####$$$$$$$$$$$!@@@@@@@@",length(boxes))
@@ -335,7 +562,7 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
 
     # BEGIN Build function eval.differential.eqns.func
 
-    ODE.func.header.char = c("function(list.boxes, list.parms, time.now, flow.multiplier=list(inflow=1,outflow=-1)){" ,"#browser() #not a good place for it")
+    ODE.func.header.char = c("function(list.boxes, list.parms, auxiliary.calculations.kit, time.now, flow.multiplier=list(inflow=1,outflow=-1)){" ,"#browser() #not a good place for it")
     CTMC.func.header.char = c("function(list.boxes, list.parms, time.now) {"                                           ,"#browser() #not a good place for it")  # , "print(time.now)"
 
     # BEGIN get ODE.within.with.part.char and CTMC.within.with.part.char
@@ -349,7 +576,10 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
     names.out.char = gsub(")","')"   ,names.out.char ,fixed=TRUE) # replace ) by ')
     names.out.char = gsub("out=","names(out)=",names.out.char ,fixed=TRUE)
 
-    ODE.within.with.part.char = paste(c(differential.eqns.char,"#browser()",out.char,names.out.char,"#print(sum(out));#print(cbind(out));#browser()","list(out)"),collapse="\n") # First tried ";\n" but realised that "\n" is sufficient
+    spy.ODE=functions.kit$spy.ODE
+   #ODE.within.with.part.char = paste(c(              differential.eqns.char,"#browser()" ,out.char,"#browser()" ,names.out.char,"#print(sum(out));#print(cbind(out));#browser()","list(out)"),collapse="\n") # First tried ";\n" but realised that "\n" is sufficient
+    ODE.within.with.part.char = paste(c(spy.ODE$spot3,differential.eqns.char,spy.ODE$spot4,out.char,spy.ODE$spot5,names.out.char,spy.ODE$spot6                                   ,"list(out)"),collapse="\n") # First tried ";\n" but realised that "\n" is sufficient
+
 
     CTMC.within.with.part.char = paste("c(", paste(ratefunc.for.adaptivetau.chunks, collapse=" ,\n "),")")
     # END get ODE.within.with.part.char and CTMC.within.with.part.char
@@ -365,8 +595,8 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
 
 
     # BEGIN Create functions eval.differential.eqns.func and ratefunc.for.adaptivetau
-    tmp.eval.differential.eqns.func = paste(c( ODE.func.header.char,  ODE.with.char, auxiliary.vars$code,  ODE.within.with.part.char,"})" ,"}"),collapse="\n" ) # code of eval.differential.eqns.func
-    tmp.ratefunc.for.adaptivetau    = paste(c(CTMC.func.header.char, CTMC.with.char, auxiliary.vars$code, CTMC.within.with.part.char,"})" ,"}"),collapse="\n" ) # code of ratefunc.for.adaptivetau
+    tmp.eval.differential.eqns.func = paste(c( ODE.func.header.char, spy.ODE$spot1,  ODE.with.char, spy.ODE$spot2, auxiliary.vars$code,  ODE.within.with.part.char,"})" ,"}"),collapse="\n" ) # code of eval.differential.eqns.func
+    tmp.ratefunc.for.adaptivetau    = paste(c(CTMC.func.header.char, spy.ODE$spot1, CTMC.with.char, spy.ODE$spot2, auxiliary.vars$code, CTMC.within.with.part.char,"})" ,"}"),collapse="\n" ) # code of ratefunc.for.adaptivetau
 
     # cat(eval.differential.eqns.func) # quick look at how it look like
     if(is.null(eval.differential.eqns.func))
@@ -382,21 +612,57 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
     # END Build function eval.differential.eqns.func
   }
 
-  resultat = list(functions=list( differential.eqns.func    = eval.differential.eqns.func ,
-                                  CTMC.eqns.func            =    ratefunc.for.adaptivetau,
-                                  CTMC.eqns.func.companion  = transitions.for.adaptivetau,
-                                  post.processing.func      = eval.post.processing.func,
-                                  post.processing.companion.kit = post.processing.companion.kit ))
+  resultat = list(input.info.verbatim = input.info.verbatim)
 
-  if(just.get.functions)
-    return ( resultat$functions )
+  resultat$input.info = list(parms.notime.0d=tmp_parm_notime_0d , parms.0d=tmp_parm_0d, parms.1d=tmp_parm_1d, parms.2d=tmp_parm_2d, initial.conditions=raw.init.conditions,
+                             auxiliary.vars=auxiliary.vars, model.flow=model_flows_tmp, post.processing=code.body.df) # original 8
+
+  resultat$input.info$episim.controls = episim.controls
+
+  resultat$input.info[names(auxiliary.calculations.kit)]  = auxiliary.calculations.kit # append auxiliary.calculations.kit  to resultat$input.info  (former may be empty list)
+
+  resultat$functions = list( differential.eqns.func    = eval.differential.eqns.func ,
+                             CTMC.eqns.func            =    ratefunc.for.adaptivetau,
+                             CTMC.eqns.func.companion  = transitions.for.adaptivetau,
+                             post.processing.func      = eval.post.processing.func,
+                             post.processing.companion.kit = post.processing.companion.kit )
+
+
+  if(run.until <=0)
+    return ( resultat )
+
+  # Should do some checks about run.from, run.until, max.tmax[1].  What follows may not be adequate and/or sufficient.
+  if(run.from >= run.until)
+    stop("\n Unexpected event: run.from >= run.until \n")
+
+  #BEGIN build deSolve.controls
+  deSolve.controls = list(method="lsoda", rtol=1e-6, atol=1e-6,  verbose = FALSE, maxsteps = 5000)
+# deSolve.controls = c(deSolve.controls , list(maxordn = 12, maxords = 5,jacfunc = NULL, jactype = "fullint")) # These 4 options are now without default values.  User can still use those options by providing them.
+# deSolve.controls$Elvis = 44 # only for testing purposes
+
+  if(is.character(episim.controls$deSolve.controls)) # FALSE if episim.controls is NULL or episim.controls$deSolve.controls is NULL or not a character
+    episim.controls$deSolve.controls =  CTMC.parms.info$parms.0d[[1]][episim.controls$deSolve.controls] # overwrite episim.controls$deSolve.controls based on what was provided in Parameter sheets
+
+  if(!is.null(episim.controls$deSolve.controls))
+    names(episim.controls$deSolve.controls) = sub("deSolve.","",names(episim.controls$deSolve.controls))
+
+  if( !is.null(episim.controls$deSolve.controls) && any(duplicated(names(episim.controls$deSolve.controls))) )
+    stop("\nDuplicate in deSolve.controls.  They may arise from improper use of nicknames (e.g. both atol and deSolve.atol provided).\n")
+
+  if(is.numeric(episim.controls$deSolve.controls$method))
+    episim.controls$deSolve.controls$method = c("lsoda", "lsode", "lsodes","lsodar","vode", "daspk", "euler", "rk4", "ode23", "ode45", "radau")[episim.controls$deSolve.controls$method]
+
+  if(is.list(episim.controls$deSolve.controls)) # FALSE if episim.controls is NULL or episim.controls$deSolve.controls is NULL or not a list
+    deSolve.controls[names(episim.controls$deSolve.controls)] = episim.controls$deSolve.controls # overwrite default deSolve.controls.
+
+  #END build deSolve.controls
 
   #==========================================================================
   #  Main routine
   #==========================================================================
   # The SEIR model with N age classes
   #
-  SEIR.n.Age.Classes.within.loop <- function( time=NULL, tmin.vect=NULL, ageless.parms = NULL, age.parms = NULL, age.age.parms = NULL,list.inits = NULL, not.parms=  c("tmin", "tmax", "agegrp", "cagegrp", "ragegrp"))
+  SEIR.n.Age.Classes.within.loop <- function( time=NULL, tmin.vect=NULL, ageless.parms = NULL, age.parms = NULL, age.age.parms = NULL,list.inits = NULL, not.parms=  c("tmin", "tmax", "agegrp", "cagegrp", "ragegrp"),deSolve.call=NULL)
   {
     if (is.null(ageless.parms))
       stop("undefined 'ageless.parms'")
@@ -447,7 +713,7 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
         }else{list.inits[[k]] <- vec.inits[k] }
       }
 
-      eval.differential.eqns.func(list.inits, list.parms, time)
+      eval.differential.eqns.func(list.inits, list.parms, auxiliary.calculations.kit, time)
 
 
     } #end of function calculate_derivatives
@@ -458,13 +724,68 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
     ###---------------------------------------------------------------------------------
     #browser()
     list.parms  = list.parms.for.lsoda
-    output <-  lsoda(y = unlist(list.inits),
-                     times = time,
-                     func =  calculate_derivatives,
-                     parms = list.parms,
-                     names.inits = names(list.inits))
+  # output <-  deSolve::lsoda(y = unlist(list.inits),
+  #                            times = time,
+  #                            func =  calculate_derivatives,
+  #                            parms = list.parms,
+  #                            names.inits = names(list.inits))
 
-    return(output)
+  #     output <- deSolve::ode(  y           = unlist(list.inits),
+  #                              times       = time,
+  #                              func        = calculate_derivatives,
+  #                              parms       = list.parms,
+  #                              names.inits = names(list.inits),
+  #                              method  = deSolve.controls$method,
+  #                              rtol    = deSolve.controls$rtol,    atol    = deSolve.controls$atol,
+  #                              jacfunc = deSolve.controls$jacfunc, jactype = deSolve.controls$jactype,
+  #                              maxordn = deSolve.controls$maxordn, maxords = deSolve.controls$maxords,
+  #                              maxsteps= deSolve.controls$maxsteps,
+  #                              verbose = deSolve.controls$verbose )
+
+
+    if(is.null(deSolve.call))
+    { # first crack at building deSolve.call.  May potentially have to many control options.  If so, this will be fixed in while loop below.
+      deSolve.call = c("y           = unlist(list.inits)",
+                       "times       = time",
+                       "func        = calculate_derivatives",
+                       "parms       = list.parms",
+                       "names.inits = names(list.inits)")
+
+      for(k in names(deSolve.controls))
+        deSolve.call = c(deSolve.call, paste0(k," = deSolve.controls$",k)) # add on stuff like "rtol    = deSolve.controls$rtol"
+    }
+   #else do nothing as deSolve.call was figured out earlier and things should work smoothly and silently in the while loop below
+
+    try.again = TRUE
+    attemps = 0
+
+    while(try.again)
+    {
+     #eval(parse(text= paste("output <- try( deSolve::ode( " , paste(deSolve.call,collapse=" , ") , "),silence=TRUE)"  )   )) # somehow silence=TRUE does not work
+      eval(parse(text= paste("output <- try( deSolve::ode( " , paste(deSolve.call,collapse=" , ") , "))"               )   )) # Could utils::capture.output help?  Did not try.
+
+      attemps = attemps +1
+      try.again=FALSE
+
+      if(is.character(output) && attemps == 1) # try to recover
+      {
+        output = gsub("=",",",gsub(")",",",output)) # replace "=" and ")" by ","
+        output = split_str( output, "," )
+        output = grep("deSolve.controls$",output,value=TRUE,fixed=TRUE)
+        if(length(output)>0) # found problematic arguments
+        {
+          for(problematic.arg in output)
+            deSolve.call = deSolve.call[!grepl(problematic.arg,deSolve.call,fixed=TRUE)]
+
+          cat("\n Ignore message about following unused argument(s). EpiSim recovered and tried again: ", output)
+          cat("\n Ignore message about following unused argument(s). EpiSim recovered and tried again: ", output, "\n")
+          try.again = TRUE
+        }
+      } # end  try to recover
+    } # end while
+
+
+    return(list(deSolve.result=output , deSolve.call= deSolve.call))
   }  # END  of function SEIR.n.Age.Classes.within.loop
 
   lean.ssa.adaptivetau <- function(sim_number, init.conditions, params,racines,etiquettes)
@@ -496,12 +817,14 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
   # Should consider dropping the "for(segment in ...)" loop and call SEIR.n.Age.Classes.within.loop only once
   # This should be feasible as this is very much what is done with lean.ssa.adaptivetau
 
-  excluded_names <- c("tmin", "tmax","agegrp","cagegrp","ragegrp")
-  previous.tmax <- 0
+
+  previous.tmax <- run.from # CTMC.parms.info$parms.0d[[1]]$tmin # 0 unless initial conditions are not for time 0
   df.out = c()
   updated_init_list = init_list
 
-  for(segment in seq(1, nTimeSegments, 1))
+  system.snapshots.list = NULL
+  deSolve.call = NULL  # character string of the call.  Needs to be determined the first time around to figure out which controls to use/dismiss
+  for(segment in seq( length(CTMC.parms.info$parms.0d) ))
   {
 
     this.parameter.by.nothing <- CTMC.parms.info$parms.0d[[segment]]
@@ -511,53 +834,98 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
     tmin <- unique(c(this.parameter.by.nothing$tmin, this.parameter.by.age$tmin, this.parameter.by.age.age$tmin))
     tmax <- unique(c(this.parameter.by.nothing$tmax, this.parameter.by.age$tmax, this.parameter.by.age.age$tmax))
 
-
     if(length(tmin)>1 || length(tmax)>1 || tmin>=tmax )
       stop(paste0("Unexpected pattern in tmin, tmax for interval ", segment))
 
-    # tt <- seq(0   , tmax - tmin, by = 1)
-    tt <- seq(tmin, tmax       , by = 1)
+    if(overlap.length(run.from,run.until,tmin,tmax))
+    {
+      # this.segment.times <- seq(0   , tmax - tmin, by = 1)
+      this.segment.times <- seq(tmin, tmax       , by = 1)
+      this.segment.times = this.segment.times [this.segment.times >= run.from]
+      tmin=this.segment.times[1] # update tmin based on above alteration of this.segment.times
+      if(!is.null(times.of.interest))
+        this.segment.times = unique(c(tmin,intersect(this.segment.times , times.of.interest),tmax))
 
-    if(tmin != previous.tmax)
-      stop(paste(interval.label , "\n  Interval lower bound not equal to previous interval upper bound"))
-
-
-
-    previous.tmax <- tmax
-    out <- SEIR.n.Age.Classes.within.loop( time=tt,
-                                           tmin.vect = CTMC.parms.info$tmin.vect,
-                                           ageless.parms = this.parameter.by.nothing,
-                                           age.parms     = this.parameter.by.age,
-                                           age.age.parms = this.parameter.by.age.age,
-                                           list.inits = updated_init_list)
-
-    out <- as.data.frame(out)
-    # ode/lsoda Output diagnostic #######################
-    #diagn <- diagnostics.deSolve(out)
-
-    out$time <- seq(tmin,tmax,1)
-    out_for_init <- out %>%
-      slice(nrow(out)) %>%    # select last row
-      pivot_longer(-time)     # fat to skinny
-    init <- out_for_init$value
-    names(init) <- out_for_init$name
-
-    #   rowns <- names(select(out,-c(time)))
-    #   out <- out %>%
-    #     mutate(N_tot = rowSums(.[rowns]))  # Total number of individuals
+      if(tmin != previous.tmax)
+        stop("\n Interval lower bound not equal to previous interval upper bound for this segment ",segment," (",tmin,"!=",previous.tmax,")")
 
 
-    #updating the initial values
-    for(k in 1:length(updated_init_list)){
-      updated_init_list[[k]][1:nagegrp] <- init[seq(nagegrp*(k-1)+1,nagegrp*k)]
-    }
 
-    if(segment < nTimeSegments)
-      out = out[-nrow(out),]
-    # Add outputs to the list
-    df.out = rbind(df.out,out)
+      previous.tmax <- tmax
+      out <- SEIR.n.Age.Classes.within.loop( time=this.segment.times,
+                                             tmin.vect = CTMC.parms.info$tmin.vect,
+                                             ageless.parms = this.parameter.by.nothing,
+                                             age.parms     = this.parameter.by.age,
+                                             age.age.parms = this.parameter.by.age.age,
+                                             list.inits    = updated_init_list,
+                                             deSolve.call  = deSolve.call )
+      deSolve.call = out$deSolve.call
+      out = out$deSolve.result
 
-  } #end for(segment in seq(1, nTimeSegments, 1))
+      # cat("\nc(is.null(times.of.interest),tmin,tmax,this.segment.times)= ",c(is.null(times.of.interest)+0,tmin,tmax,this.segment.times),"\n")
+      # browser()
+
+      out <- as.data.frame(out)
+      # ode/lsoda Output diagnostic #######################
+      #diagn <- diagnostics.deSolve(out)
+
+      out$time <- this.segment.times # seq(tmin,tmax,1)
+      out_skinny <- out %>%
+        dplyr::slice(nrow(out)) %>%    # select last row
+        tidyr::pivot_longer(-time)     # fat to skinny
+      init <- out_skinny$value
+      names(init) <- out_skinny$name
+
+      #   rowns <- names(select(out,-c(time)))
+      #   out <- out %>%
+      #     mutate(N_tot = rowSums(.[rowns]))  # Total number of individuals
+
+      if(!is.null(episim.controls$export.system.snapshot.time) && is.null(system.snapshots.list))
+      {
+        skinny.snapshot = subset(out,time %in% episim.controls$export.system.snapshot.time)
+        if(nrow(skinny.snapshot) == 1)
+        {  # get system.snapshots.list$one.time
+          out_skinny <- out %>%
+            dplyr::filter(time == episim.controls$export.system.snapshot.time ) %>%    # select last row
+            tidyr::pivot_longer(-time) %>%    # fat to skinny
+            as.data.frame
+
+          out_skinny$rev.name = sapply(out_skinny$name ,rev_str) # vacc0.S1 ... vacc0.S6 vacc0.D1 ... vacc0.D6-> 1S.0ccav ... 6S.0ccav  1D.0ccav ... 6D.0ccav
+          out_skinny$age.char = paste0("age",substr(out_skinny$rev.name,1,1))
+          substr(out_skinny$rev.name,1,1) = "@"
+          out_skinny$rev.name=sub("@","",out_skinny$rev.name)
+          out_skinny$NAME = sapply(out_skinny$rev.name ,rev_str)
+          out_skinny$rev.name = c()
+          out_skinny$name = c()
+
+          system.snapshot.one.time = as.data.frame( tidyr::pivot_wider(out_skinny, names_from = age.char, values_from = value) )
+          names(system.snapshot.one.time)[!(names(system.snapshot.one.time) %in% c("time","NAME"))] = init.cond.numeric.vars
+          system.snapshots.list = list(single.time = system.snapshot.one.time)
+        }
+      }
+
+
+      #updating the initial values
+      for(k in 1:length(updated_init_list)){
+        updated_init_list[[k]][1:nagegrp] <- init[seq(nagegrp*(k-1)+1,nagegrp*k)]
+      }
+
+      if(segment < length(CTMC.parms.info$parms.0d) )
+        out = out[-nrow(out),]
+      # Add outputs to the list
+      df.out = rbind(df.out,out)
+    } # END if(overlap.length(run.from,run.until,tmin,tmax))
+
+
+
+  } #end for(segment in ... )
+
+  if(!is.null(episim.controls$import.system.snapshots))
+    df.out = rbind( subset(episim.controls$import.system.snapshots,time < min(df.out$time)) , df.out)
+
+  if(!is.null(episim.controls$export.system.snapshot.time) && !is.null(system.snapshots.list))
+    system.snapshots.list$all.times = subset(df.out,time <= episim.controls$export.system.snapshot.time)
+
 
 
   CTMC.out=NULL
@@ -604,9 +972,10 @@ seir.n.age.classes = function(file.name, sheets.names, just.get.functions=FALSE,
   colnames( resultat$solution) = c("time",pretty.compartments.age)
   #END add on $solution.inflows, $solution.outflows and $solution to resultat
 
-  resultat$input.info = list(parms.notime.0d=tmp_parm_notime_0d , parms.0d=tmp_parm_0d, parms.1d=tmp_parm_1d, parms.2d=tmp_parm_2d, initial.conditions=raw.init.conditions,
-                             auxiliary.vars=auxiliary.vars, model.flow=model_flows_tmp, post.processing=code.body.df)
-  resultat$input.info.verbatim = input.info.verbatim
+  resultat$system.snapshots = system.snapshots.list
+  time.stamps$end = Sys.time()
+  resultat$time.stamps = time.stamps
+
 
   eval.post.processing.func(resultat)
 } #end of SEIR.n.Age.Classes function
@@ -690,10 +1059,27 @@ get.silly.model.chunk = function(model_flows, init.cond, init.cond.numeric.vars,
 #' @return none.
 
 save.model.in.workbook = function(input.info.list,file_name,map.names)
-{  # map.names is named vector saying map.names["parms.1d"  ] =  "Parameters by Age"
-  # map.names = unlist(sheet_names) # allows to map "parms.1d" into "Parameters by Age" for instance
-  names(input.info.list) = map.names[names(input.info.list)] # $parms.1d is now $'Parameters by Age'
-  openxlsx::write.xlsx(input.info.list, file_name, colWidths = c(NA, "auto", "auto"))
+{  # map.names is named list saying map.names[["initial.conditions"  ]] =  "Initial conditions"  for instance
+   # map.names is only needed for the last 4 pieces: "initial.conditions", "model.flow", "auxiliary.vars", "post.processing"
+   # One may/should use  map.names = input.info.verbatim
+
+ # browser()
+  expected.pieces = c("parms.notime.0d","parms.0d","parms.1d","parms.2d","initial.conditions","model.flow","auxiliary.vars","post.processing") # same as expected.sheets.names in seir.n.age.classes
+
+  if( !all( expected.pieces %in% names(input.info.list) ) )
+    stop( paste("\n input.info.list must provide the following:",paste(expected.pieces,collapse=", ")) )
+
+  output.list = list()
+  for(piece in expected.pieces)
+  {
+    this.chunk = input.info.list[[piece]]
+    if(is.data.frame(this.chunk))
+      output.list[[ map.names[[piece]][1] ]]= this.chunk # we use map.names[[piece]][1] as map.names[[piece]] will typically be of length > 1 (e.g. c("Something", NA)  of length 2 here)
+    else # this.chunk is a list.  Furthermore, it is a named list and all its members are data.frames.
+      output.list[ names(this.chunk) ] = this.chunk # add on the content of this.chunk to output.list
+  }
+
+  openxlsx::write.xlsx( output.list, file_name, colWidths = c(NA, "auto", "auto"))
 }
 
 #' Perform a parameter sweep
@@ -707,86 +1093,111 @@ save.model.in.workbook = function(input.info.list,file_name,map.names)
 #' @param seir.object a box/compartment model object.
 #' @param parm.cloud.grid.specs a data frame of parameter sweep specifications.
 #' @param only.show.parms.to.try a logical value. By default, FALSE.
+#' @param dump.progress a list with components $location and $naming.extra. By default, NULL.
 #'
 #' @return a list of parameter sweep inputs and results.
 
-try.various.parms.values = function(seir.object,parm.cloud.grid.specs,only.show.parms.to.try=FALSE)
+try.various.parms.values = function(seir.object,parm.cloud.grid.specs,only.show.parms.to.try=FALSE,dump.progress=NULL)
 {
-  #parm.cloud.grid.specs is a list that should contain the following 7 things
+  #parm.cloud.grid.specs is a list that should contain the following components
+  # *  $backend.transformation
+  # *  $reference.alteration
+  # *  $tmin.alter.scope
+  # along with either component parms.to.try.raw or the components listed below (which allows one to get/compute parms.to.try.raw)
   # *  $hypercube.lower.bounds , $hypercube.upper.bounds, $hypercube.apex.mode
   # *  $n.repeat.within.hypercube
   # *  $LatinHypercubeSampling
   # *  $racine
-  # *  $tmin.alter.scope
-  # *  $backend.transformation
-  # *  $reference.alteration
 
-  lower.bound      = parm.cloud.grid.specs$hypercube.lower.bounds
-  upper.bound      = parm.cloud.grid.specs$hypercube.upper.bounds
-  apex             = parm.cloud.grid.specs$hypercube.apex.mode  # may be NULL
-  n.repeat         = parm.cloud.grid.specs$n.repeat.within.hypercube
+
+
+  if(is.null(parm.cloud.grid.specs$message.length))
+    parm.cloud.grid.specs$message.length = 9999
+
+  if(is.null(parm.cloud.grid.specs$parms.to.try.raw))
+  { # BEGIN Get parms.to.try.raw from scratch
+    # It is here and only here that we use
+    # *  $hypercube.lower.bounds , $hypercube.upper.bounds, $hypercube.apex.mode
+    # *  $n.repeat.within.hypercube
+    # *  $LatinHypercubeSampling
+    # *  $racine
+
+    set.seed(parm.cloud.grid.specs$racine)
+    lower.bound      = parm.cloud.grid.specs$hypercube.lower.bounds
+    upper.bound      = parm.cloud.grid.specs$hypercube.upper.bounds
+    apex             = parm.cloud.grid.specs$hypercube.apex.mode  # may be NULL
+    n.repeat         = parm.cloud.grid.specs$n.repeat.within.hypercube
+
+
+    # Compute all possible candidate by multiplier combinations
+    #multiplier_combos <- expand.grid(candidates, KEEP.OUT.ATTRS = FALSE)
+    lower.bound.expanded = expand.grid(lower.bound, KEEP.OUT.ATTRS = FALSE)
+    upper.bound.expanded = expand.grid(upper.bound, KEEP.OUT.ATTRS = FALSE)
+    if(any(dim(lower.bound.expanded) != dim(upper.bound.expanded) ))
+      stop('dimension mismatch')
+    if(any(colnames(lower.bound.expanded) != colnames(upper.bound.expanded) ))
+      stop('column name mismatch')
+
+    lower.bound.expanded = lower.bound.expanded[rep(seq(nrow(lower.bound.expanded)) , n.repeat ),,drop=F]
+    upper.bound.expanded = upper.bound.expanded[rep(seq(nrow(upper.bound.expanded)) , n.repeat ),,drop=F]
+    lower.bound.expanded = data.matrix(lower.bound.expanded)
+    upper.bound.expanded = data.matrix(upper.bound.expanded)
+    if(!is.null(apex))
+    {
+      apex.expanded = expand.grid(apex, KEEP.OUT.ATTRS = FALSE)
+      apex.expanded = apex.expanded[rep(seq(nrow(apex.expanded)) , n.repeat ),]
+      apex.expanded = data.matrix(apex.expanded)
+    }
+
+    if(parm.cloud.grid.specs$LatinHypercubeSampling)
+      random.vect= c( lhs::randomLHS( nrow(upper.bound.expanded),ncol(upper.bound.expanded) ) )
+    else
+      random.vect= runif(prod(dim(upper.bound.expanded)))
+
+
+    if(is.null(apex))
+      parms.to.try.raw =    stats::qunif    (random.vect,lower.bound.expanded,upper.bound.expanded)
+    else
+      parms.to.try.raw = triangle::qtriangle(random.vect,lower.bound.expanded,upper.bound.expanded,apex.expanded)
+
+    parms.to.try.raw = 0*lower.bound.expanded + parms.to.try.raw
+
+    # END Get parms.to.try.raw from scratch
+
+    #parms.to.try.verbose = as.data.frame(parms.to.try)
+    #colnames(parms.to.try.verbose) = paste0(colnames(parms.to.try),operation.label)
+    #rownames(parms.to.try.verbose) = c()
+  }# END is.null(parm.cloud.grid.specs$parms.to.try.raw)
+  else
+  {  # just use parms.to.try.raw as provided by user
+    parms.to.try.raw = as.matrix( parm.cloud.grid.specs$parms.to.try.raw )
+  }
+
+
+  if(only.show.parms.to.try)
+  {
+     retourner.ceci = parm.cloud.grid.specs
+     retourner.ceci$parms.to.try.raw=parms.to.try.raw
+     return (retourner.ceci)
+  }
+
   tmin.alter.scope = parm.cloud.grid.specs$tmin.alter.scope
-  # racine           = parm.cloud.grid.specs$racine
-  # backend.transformation = parm.cloud.grid.specs$backend.transformation
-  # reference.alteration      = parm.cloud.grid.specs$reference.alteration
-
-  set.seed(parm.cloud.grid.specs$racine)
 
   operation_list = list(overwrite = function(current,new)         {0*current+new        } ,
                         add       = function(current,increment  ) {  current+increment  } ,
                         multiply  = function(current,mult_factor) {  current*mult_factor} )
+
   operation_func = operation_list[[parm.cloud.grid.specs$reference.alteration]]
   operation.label = c(overwrite=".overwrite",add=".add",multiply=".multiplier")[parm.cloud.grid.specs$reference.alteration]
 
-
-  # Compute all possible candidate by multiplier combinations
-  #multiplier_combos <- expand.grid(candidates, KEEP.OUT.ATTRS = FALSE)
-  lower.bound.expanded = expand.grid(lower.bound, KEEP.OUT.ATTRS = FALSE)
-  upper.bound.expanded = expand.grid(upper.bound, KEEP.OUT.ATTRS = FALSE)
-  if(any(dim(lower.bound.expanded) != dim(upper.bound.expanded) ))
-    stop('dimension mismatch')
-  if(any(colnames(lower.bound.expanded) != colnames(upper.bound.expanded) ))
-    stop('column name mismatch')
-
-  lower.bound.expanded = lower.bound.expanded[rep(seq(nrow(lower.bound.expanded)) , n.repeat ),,drop=F]
-  upper.bound.expanded = upper.bound.expanded[rep(seq(nrow(upper.bound.expanded)) , n.repeat ),,drop=F]
-  lower.bound.expanded = data.matrix(lower.bound.expanded)
-  upper.bound.expanded = data.matrix(upper.bound.expanded)
-  if(!is.null(apex))
-  {
-    apex.expanded = expand.grid(apex, KEEP.OUT.ATTRS = FALSE)
-    apex.expanded = apex.expanded[rep(seq(nrow(apex.expanded)) , n.repeat ),]
-    apex.expanded = data.matrix(apex.expanded)
-  }
-
-  if(parm.cloud.grid.specs$LatinHypercubeSampling)
-    random.vect= c( lhs::randomLHS( nrow(upper.bound.expanded),ncol(upper.bound.expanded) ) )
-  else
-    random.vect= runif(prod(dim(upper.bound.expanded)))
-
-  # parms.to.try = (upper.bound.expanded - lower.bound.expanded) *  random.vect
-  # parms.to.try = lower.bound.expanded + parms.to.try
-  if(is.null(apex))
-    parms.to.try =    stats::qunif    (random.vect,lower.bound.expanded,upper.bound.expanded)
-  else
-    parms.to.try = triangle::qtriangle(random.vect,lower.bound.expanded,upper.bound.expanded,apex.expanded)
-
-  parms.to.try = 0*lower.bound.expanded + parms.to.try
-  parms.to.try = parm.cloud.grid.specs$backend.transformation(parms.to.try)
-
-  parms.to.try.verbose = as.data.frame(parms.to.try)
-  colnames(parms.to.try.verbose) = paste0(colnames(parms.to.try),operation.label)
-  rownames(parms.to.try.verbose) = c()
-
-  if(only.show.parms.to.try)
-    return (list(parms.to.try=parms.to.try.verbose))
+  parms.to.try = parm.cloud.grid.specs$backend.transformation(parms.to.try.raw)  # e.g. apply exp() function to parms.to.try.raw
 
 
   # Recover some info from baseline/template (i.e. SEIR.object)
 
   file_name_for_sweep   = seir.object$input.info.verbatim$file.name
-  sheet_names_for_sweep = seir.object$input.info           # Can use either of those two lines ... in theory (not tested)
   sheet_names_for_sweep = seir.object$input.info.verbatim  # Can use either of those two lines ... in theory (not tested)
+  sheet_names_for_sweep = seir.object$input.info           # Can use either of those two lines ... in theory (not tested)
 
   baseline.parms.notime.0d = seir.object$input.info$parms.notime.0d  # data frame of 0d parameters (i.e. not by age)
   baseline.parms.0d = seir.object$input.info$parms.0d  # data frame of 0d parameters (i.e. not by age)
@@ -800,35 +1211,63 @@ try.various.parms.values = function(seir.object,parm.cloud.grid.specs,only.show.
 
   flows.of.interest = gsub("solution.","",intersect(names(seir.object),c("solution.inflows","solution.outflows")))
 
-  list.sweep = list() #        store results in list  ...
-  df.sweep = c()      # ... or store results in data.frame
+  list.input.info     = list()
+  list.sweep          = list() #        store results in list  ...
+  df.sweep            = c()    # ... or store results in data.frame
   outcomes.summary.df = c()
+  time.stamps         = c()
 
-  for(i in 1:nrow(lower.bound.expanded)) {
+  for(i in 1:nrow(parms.to.try)) {
     row <-  parms.to.try[i,]
     names(row) = colnames(parms.to.try)
     #this.label <- paste0(names(row),       ".multiplier= ", row, collapse = " , ")
     this.label <- paste0(names(row), operation.label, "= ", row, collapse = " , ")
 
+    this.message = paste("\n Doing",i,"of",nrow(parms.to.try),"simulations :",this.label)
+    cat(substr(this.message,1,parm.cloud.grid.specs$message.length))
 
-    cat("\n Doing",i,"of",nrow(parms.to.try),"simulations :",this.label)
-
-    parms.notime.0d = baseline.parms.notime.0d  # data frame of 0d parameters to be altered
-    parms.0d = baseline.parms.0d  # data frame of 0d parameters to be altered
-    parms.1d = baseline.parms.1d  # data frame of 1d parameters to be altered
-    parms.2d = baseline.parms.2d  # data frame of 2d parameters to be altered
+    parms.notime.0d = baseline.parms.notime.0d  # list of data.frames of 0d parameters to be altered
+    parms.0d = baseline.parms.0d                # list of data.frames of 0d parameters to be altered
+    parms.1d = baseline.parms.1d                # list of data.frames of 1d parameters to be altered
+    parms.2d = baseline.parms.2d                # list of data.frames of 2d parameters to be altered
 
     # Modify the parameter values at the specified tmin.alter.scope
-    for(parameter in names(row)) {
-      if(parameter %in% names(parms.notime.0d))
-        parms.notime.0d[1                           , parameter] = operation_func( parms.notime.0d[1,                          parameter]  , row[[parameter]] )
-      else if(parameter %in% names(parms.0d))
-        parms.0d[parms.0d$tmin %in% tmin.alter.scope, parameter] = operation_func(subset(parms.0d,tmin %in% tmin.alter.scope)[[parameter]] , row[[parameter]] )
-      else if(parameter %in% names(parms.1d))
-        parms.1d[parms.1d$tmin %in% tmin.alter.scope, parameter] = operation_func(subset(parms.1d,tmin %in% tmin.alter.scope)[[parameter]] , row[[parameter]] )
-      else if(parameter %in% names(parms.2d))
-        parms.2d[parms.2d$tmin %in% tmin.alter.scope, parameter] = operation_func(subset(parms.2d,tmin %in% tmin.alter.scope)[[parameter]] , row[[parameter]] )
-      else
+    for(parameter in names(row))
+    {
+      found=FALSE
+      if(!found)
+        for(k in names(parms.notime.0d)) # parms.notime.0d is a list, parms.notime.0d[[k]] is a data.frame
+          if(parameter %in% names(parms.notime.0d[[k]]))
+          {
+            parms.notime.0d[[k]][1                           , parameter] = operation_func( parms.notime.0d[[k]][1,                          parameter]  , row[[parameter]] )
+            found = TRUE
+          }
+
+      if(!found)
+        for(k in names(parms.0d)) # parms.0d is a list, parms.0d[[k]] is a data.frame
+          if(parameter %in% names(parms.0d[[k]]))
+          {
+            parms.0d[[k]][parms.0d[[k]]$tmin %in% tmin.alter.scope, parameter] = operation_func(subset(parms.0d[[k]],tmin %in% tmin.alter.scope)[[parameter]] , row[[parameter]] )
+            found = TRUE
+          }
+
+      if(!found)
+        for(k in names(parms.1d)) # parms.1d is a list, parms.1d[[k]] is a data.frame
+          if(parameter %in% names(parms.1d[[k]]))
+          {
+            parms.1d[[k]][parms.1d[[k]]$tmin %in% tmin.alter.scope, parameter] = operation_func(subset(parms.1d[[k]],tmin %in% tmin.alter.scope)[[parameter]] , row[[parameter]] )
+            found = TRUE
+          }
+
+      if(!found)
+        for(k in names(parms.2d)) # parms.2d is a list, parms.2d[[k]] is a data.frame
+          if(parameter %in% names(parms.2d[[k]]))
+          {
+            parms.2d[[k]][parms.2d[[k]]$tmin %in% tmin.alter.scope, parameter] = operation_func(subset(parms.2d[[k]],tmin %in% tmin.alter.scope)[[parameter]] , row[[parameter]] )
+            found = TRUE
+          }
+
+      if(!found)
         stop(paste(parameter,"was not found in any parameter sheet"))# Parameter was not found in any parameter sheet
 
     }
@@ -838,7 +1277,12 @@ try.various.parms.values = function(seir.object,parm.cloud.grid.specs,only.show.
     sheet_names_for_sweep$parms.1d = parms.1d # altered data.frame goes in sheet_names_for_sweep
     sheet_names_for_sweep$parms.2d = parms.2d # altered data.frame goes in sheet_names_for_sweep
 
-    this.result = seir.n.age.classes(file_name_for_sweep,sheet_names_for_sweep,also.get.flows=flows.of.interest,functions.kit = functions.kit, agegrp.glue=agegrp.glue, CTMC.random.seeds=CTMC.racines.alea)
+    this.result = seir.n.age.classes(file_name_for_sweep, sheet_names_for_sweep,
+                                     episim.controls   = seir.object$input.info$episim.controls,
+                                     also.get.flows    = flows.of.interest,
+                                     functions.kit     = functions.kit,
+                                     agegrp.glue       = agegrp.glue,
+                                     CTMC.random.seeds = CTMC.racines.alea)
 
     # Add on univariate stuff like maxI or maxI.time to outcomes.summary.df
     summary.template = data.frame(etiquette = this.label)
@@ -852,25 +1296,35 @@ try.various.parms.values = function(seir.object,parm.cloud.grid.specs,only.show.
     #  summary.chunk[[paste0(parameter, operation.label)]] <- row[[parameter]]
 
     outcomes.summary.df = rbind(outcomes.summary.df,summary.chunk)
-    #print(names(outcomes.summary.df))
 
     # Add this.label and the parameter multpliers to the this.result$solution data frame
     #this.result$solution$etiquette <- this.label
     for(parameter in names(row))
       this.result$solution[[paste0(parameter, operation.label)]] <- row[[parameter]]
 
-    #Update list.sweep and df.sweep
-    list.sweep[[this.label]] = this.result[c("solution","input.info","input.info.verbatim")] # this.result$solution
-    df.sweep = rbind(df.sweep,this.result$solution)
-  }
-  rownames(outcomes.summary.df) = c()
-  outcomes.summary.df$etiquette = c() # drop etiquette.  Not really useful to keep.
+    #Update  df.sweep and friends
+   #list.sweep[[this.label]] = this.result[c("solution","input.info","input.info.verbatim")] # this.result$solution
+    list.input.info[[this.label]] = this.result$input.info
+    df.sweep    = rbind(df.sweep   ,this.result$solution)
+    time.stamps = rbind(time.stamps,this.result$time.stamps)
+    results.this.far = list(parm.cloud.grid.specs = parm.cloud.grid.specs,
+                            parms.to.try.raw = parms.to.try.raw,
+                            time.stamps = time.stamps,
+                            outcomes.summary.df = outcomes.summary.df,
+                            list.input.info = list.input.info,
+                            #list.sweep=list.sweep,
+                            df.sweep = df.sweep,
+                            system.snapshots=this.result$system.snapshots)
 
-  list(parm.cloud.grid.specs = parm.cloud.grid.specs,
-       parms.to.try = parms.to.try.verbose,
-       outcomes.summary.df = outcomes.summary.df,
-       df.sweep = df.sweep,
-       list.sweep=list.sweep)
+    if(!is.null(dump.progress))
+      verbose.save(results.this.far, path.with.trailing.slash = dump.progress$location, time.stamp = dump.progress$naming.extra)
+
+  }  # END for(i in 1:nrow(parms.to.try))
+
+  rownames(results.this.far$outcomes.summary.df) = c()
+  results.this.far$outcomes.summary.df$etiquette = c() # drop etiquette.  Not really useful to keep.
+  results.this.far
+
 }
 
 #' Assess parameter importance
@@ -944,6 +1398,9 @@ compare.models = function(solution1,solution2,age.suffix2="",ignore.vars=NULL,ti
   if(is.list(solution2) && !is.data.frame(solution2) && "solution" %in% names(solution2))
     solution2 = solution2$solution
 
+  times.common = intersect(solution1$time,solution2$time)
+  solution1 = subset(solution1,time %in% times.common)
+  solution2 = subset(solution2,time %in% times.common)
 
   if(nrow(solution1) != nrow(solution2))
     stop("\n Each $solution should have the same number of rows.")
@@ -978,29 +1435,6 @@ compare.models = function(solution1,solution2,age.suffix2="",ignore.vars=NULL,ti
   as.data.frame(mat.diff)
 }
 
-#' Save R objects to a file
-#'
-#' @description
-#' This function is a wrapper for the base `R` [save()] function that adds prefix/suffix information and compression to the R objects that are saved to file.
-#'
-#' @export
-#'
-#' @param object.name a character element representing the R object to be saved.
-#' @param prefix.suffix a named (prefix, suffix), two-element character vector representing the prefix and suffix for the file name. By default, the prefix is "This file contains an R object called " and the suffix is ".SavedFromR".
-#' @param path.with.trailing.slash set to null by default.
-#' @param time.stamp the format for the timestamp that appears in the file name. By default, the format is yyyy-mm-dd hh-mm-ss.
-#'
-#' @return none.
-
-verbose.save = function(object.name,path.with.trailing.slash="",prefix.suffix=c(prefix="This file contains an R object called ",suffix=".SavedFromR"),time.stamp=gsub(":","-",Sys.time()))
-{
-  if(time.stamp != "")
-    time.stamp = paste0(" (", time.stamp,")")
-
-  code = paste0(prefix.suffix["prefix"],object.name,time.stamp,prefix.suffix["suffix"])
-  code = paste0("save(",object.name,",file='",path.with.trailing.slash,code,"', compress = 'xz')")
-  eval(parse(text=code))
-}
 
 #' Get hypercube sampling specifications
 #'

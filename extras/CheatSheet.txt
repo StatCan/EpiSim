@@ -1,0 +1,59 @@
+BEGIN Step 1: Building package EpiSim (ingredients are in folder EpiSim )
+
+A) In DOS window, go to folder that contains the folder you want to build (e.g. go to ...\Build_This if want to build ...\Build_This\EpiSim )
+B) Issue command R CMD build EpiSim
+   Note that if you added R's path to Window's %path%, you can only type R.exe to invoke it from anywhere.
+   In R/Rstudio, R.home() will give the path R is in.
+   If R is not added to your Window's %path%, your call to R needs to include its path as shown in exhibit below
+
+BEGIN exhibit    
+    C:\Users\nadecla\Documents\R\Build_This>
+         C:\PROGRA~1\R\R-3.6.2\bin\x64\R.exe   CMD build EpiSim
+    * checking for file 'EpiSim/DESCRIPTION' ... OK
+    * preparing 'EpiSim':
+    * checking DESCRIPTION meta-information ... OK
+    * checking for LF line-endings in source and make files and shell scripts
+    * checking for empty or unneeded directories
+    * creating default NAMESPACE file
+    * building 'EpiSim_0.12.12.tar.gz'
+
+
+    C:\Users\nadecla\Documents\R\Build_This>
+END exhibit  
+
+END Step 1: Building package EpiSim (ingredients are in folder EpiSim)
+
+
+
+BEGIN Step 2: Check package  (run   "R CMD check"    on the .tar.gz file created above)
+
+BEGIN exhibit  
+
+    C:\Users\nadecla\Documents\R\Build_This> 
+         C:\PROGRA~1\R\R-3.6.2\bin\x64\R.exe   CMD check EpiSim_0.12.12.tar.gz
+    * using log directory 'C:/Users/nadecla/Documents/R/Build_This/EpiSim.Rcheck'
+
+    <Lots of details snipped. > 
+
+    Status: 1 WARNING, 3 NOTEs
+    See
+      'C:/Users/nadecla/Documents/R/Build_This/EpiSim.Rcheck/00check.log'
+    for details.
+
+    C:\Users\nadecla\Documents\R\Build_This>
+
+END exhibit  
+
+
+END Step 2: Check package  (run   "R CMD check"    on the .tar.gz file created above)
+
+
+BEGIN Step 3: Use package
+
+install.packages("C:/Users/nadecla/Documents/R/win-library/EpiSim_0.12.12.tar.gz",repos=NULL,type="source")
+library(EpiSim)
+
+print(sessionInfo(),locale=FALSE) # shows EpiSim_0.12.12 (among other things)
+help(try.various.parms.values) # shows documentation for EpiSim package's try.various.parms.values function.
+
+END Step 3: Use package

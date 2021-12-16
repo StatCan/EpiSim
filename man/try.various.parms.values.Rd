@@ -7,7 +7,8 @@
 try.various.parms.values(
   seir.object,
   parm.cloud.grid.specs,
-  only.show.parms.to.try = FALSE
+  only.show.parms.to.try = FALSE,
+  dump.progress = NULL
 )
 }
 \arguments{
@@ -16,6 +17,8 @@ try.various.parms.values(
 \item{parm.cloud.grid.specs}{a data frame of parameter sweep specifications.}
 
 \item{only.show.parms.to.try}{a logical value. By default, FALSE.}
+
+\item{dump.progress}{a list with components $location and $naming.extra. By default, NULL.}
 }
 \value{
 a list of parameter sweep inputs and results.

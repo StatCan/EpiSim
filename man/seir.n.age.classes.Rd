@@ -7,7 +7,7 @@
 seir.n.age.classes(
   file.name,
   sheets.names,
-  just.get.functions = FALSE,
+  episim.controls = NULL,
   functions.kit = NULL,
   also.get.flows = NULL,
   agegrp.glue = "",
@@ -19,7 +19,7 @@ seir.n.age.classes(
 
 \item{sheets.names}{a list.}
 
-\item{just.get.functions}{a logical element (by default, FALSE).}
+\item{episim.controls}{a list containing one or more of the following: $run.until, $insert.tmins, $insert.tmin.char, $times.of.interest, $import.system.snapshots, $export.system.snapshot.time, $deSolve.controls (by default, NULL).}
 
 \item{functions.kit}{a list containing one or more of the following: $differential.eqns.func, $post.processing.func, $post.processing.companion.kit, $CTMC.eqns.func, $CTMC.eqns.func.companion (by default, NULL).}
 
